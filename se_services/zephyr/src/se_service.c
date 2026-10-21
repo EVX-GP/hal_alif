@@ -149,8 +149,11 @@ static void se_service_apply_run_profile_for_state(enum pm_state state,
 	const run_profile_t *selected = match ? match : default_profile;
 
 	if (!selected) {
-		LOG_WRN("aipm: no run profile for state %d/%d; skipping",
+		LOG_ERR("aipm: no run profile for state %d/%d",
 			state, substate_id);
+		/* Neither SYS_INIT nor a PM notifier can veto subsequent device
+		 * initialization/resume by merely logging a failure. */
+		k_panic();
 		return;
 	}
 
@@ -160,6 +163,7 @@ static void se_service_apply_run_profile_for_state(enum pm_state state,
 	if (err) {
 		LOG_ERR("aipm: set_run_cfg failed (state %d/%d): %d",
 			state, substate_id, err);
+		k_panic();
 	}
 }
 
@@ -245,10 +249,10 @@ static const struct aipm_off_profile_entry aipm_off_profiles[] = {
  * Copies the const entry to a local so se_service_set_off_cfg (non-const ptr)
  * can be called cleanly.
  */
-static void se_service_apply_off_profile_for_state(enum pm_state state,
+static int se_service_apply_off_profile_for_state(enum pm_state state,
 						   uint8_t substate_id)
 {
-	for (int i = 0; i < ARRAY_SIZE(aipm_off_profiles); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(aipm_off_profiles); i++) {
 		if (aipm_off_profiles[i].state   == state &&
 		    aipm_off_profiles[i].substate == substate_id) {
 			off_profile_t p = aipm_off_profiles[i].profile;
@@ -259,11 +263,14 @@ static void se_service_apply_off_profile_for_state(enum pm_state state,
 					" (state %d/%d): %d",
 					state, substate_id, err);
 			}
-			return;
+			return err;
 		}
 	}
 	LOG_DBG("aipm: no off profile for state %d/%d; skipping",
 		state, substate_id);
+	/* A deep transition cannot rely on an unspecified retained profile. */
+	return state == PM_STATE_SUSPEND_TO_RAM || state == PM_STATE_SOFT_OFF ?
+		-ENOENT : 0;
 }
 
 #endif /* CONFIG_ALIF_SE_DTS_OFF_PROFILE */
@@ -1609,7 +1616,7 @@ int se_service_boot_reset_soc(void)
 
 int se_service_boot_reset_cpu(uint32_t cpu_id)
 {
-	int err, i = 0, resp_err = -1;
+	int err, resp_err;
 
 	/* Ensure SE is ready to receive service calls */
 	err = se_service_ensure_ready();
@@ -1627,18 +1634,14 @@ int se_service_boot_reset_cpu(uint32_t cpu_id)
 	se_service_all_svc_d.cpu_reboot_d.header.hdr_service_id = SERVICE_BOOT_RESET_CPU;
 	se_service_all_svc_d.cpu_reboot_d.send_cpu_id = cpu_id;
 
-	while (i < MAX_TRIES) {
-		err = send_msg_to_se((uint32_t *)&se_service_all_svc_d.service_header,
-				     sizeof(se_service_all_svc_d.service_header), SERVICE_TIMEOUT);
-		if (!err) {
-			break;
-		}
-		/* SE service timed out. Increment count */
-		++i;
-	}
+	/* Reset is not idempotent: a lost reply may mean the CPU already reset.
+	 * Leave recovery to the caller rather than replaying against a fresh boot.
+	 * Include the complete request/response in cache maintenance. */
+	err = send_msg_to_se((uint32_t *)&se_service_all_svc_d.cpu_reboot_d,
+			     sizeof(se_service_all_svc_d.cpu_reboot_d), SERVICE_TIMEOUT);
 	resp_err = se_service_all_svc_d.cpu_reboot_d.resp_error_code;
 	k_mutex_unlock(&svc_mutex);
-	if (i >= MAX_TRIES) {
+	if (err) {
 		LOG_ERR("Failed to reset cpu with SE (error = %d)\n", err);
 		return err;
 	}
@@ -1989,8 +1992,11 @@ static void se_service_pm_notify_entry(enum pm_state state)
 	{
 		const struct pm_state_info *info = pm_state_next_get(0);
 
-		se_service_apply_off_profile_for_state(info->state,
-						       info->substate_id);
+		int err = se_service_apply_off_profile_for_state(info->state,
+							info->substate_id);
+		/* Notifiers cannot veto entry. Stop before context loss if the SE
+		 * rejected retention/wake configuration; logging alone is unsafe. */
+		if (err) { k_panic(); }
 	}
 #endif
 
@@ -2040,14 +2046,16 @@ int se_service_boot_cpu(uint32_t cpu_id, uint32_t address)
 	err = send_msg_to_se((uint32_t *)&se_service_all_svc_d.boot_cpu_svc_d,
 			sizeof(se_service_all_svc_d.boot_cpu_svc_d), SERVICE_TIMEOUT);
 
+	/* The service buffer is shared by every SE request. Capture the reply
+	 * before releasing ownership; a waiting service may overwrite it at
+	 * unlock. Transport errors still take precedence over this snapshot. */
+	resp_err = se_service_all_svc_d.boot_cpu_svc_d.resp_error_code;
 	k_mutex_unlock(&svc_mutex);
 
 	if (err) {
 		LOG_ERR("SE service call failed with %d\n", err);
 		return err;
 	}
-
-	resp_err = se_service_all_svc_d.boot_cpu_svc_d.resp_error_code;
 
 	if (resp_err) {
 		LOG_ERR("boot_cpu response error = %d\n", resp_err);
